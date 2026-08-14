@@ -47,6 +47,7 @@ ECOLINES_ROUTES = [
         "origin": 917,
         "destination": 100,
         "depart_date": "2026-09-04",
+        "departure_times": ["09:15", "10:10"],
     },
     # Добавляй новые маршруты Ecolines сюда
 ]
@@ -174,10 +175,10 @@ def extract_min_price(journeys: list):
     return min(prices) if prices else None
 
 
-async def fetch_ecolines_min_price(page, route: dict):
+async def fetch_ecolines_trip_prices(page, route: dict):
     """
-    Открывает страницу поиска Ecolines (сервер-рендеренный HTML) и вытаскивает
-    минимальную цену среди рейсов.
+    Открывает страницу поиска Ecolines и возвращает словарь
+    {время_отправления: цена} по всем найденным прямым рейсам дня.
     """
     url = (
         f"{ECOLINES_SEARCH_URL}?allowedCurrency=26&locale=by&currency=26"
@@ -190,16 +191,21 @@ async def fetch_ecolines_min_price(page, route: dict):
     html = await page.content()
     soup = BeautifulSoup(html, "html.parser")
 
-    prices = []
+    trips = {}
     for card in soup.select("div.row.text-center"):
         times = card.select("h2.no-mp")
         btn = card.select_one("button.btn-primary.btn-lg[name=journey]")
         if len(times) >= 2 and btn:
+            departure_time = times[0].get_text(strip=True)
             match = re.search(r"([\d.]+)\s*BYN", btn.get_text(" ", strip=True))
             if match:
-                prices.append(float(match.group(1)))
+                price = float(match.group(1))
+                # Если один и тот же рейс встретился дважды (например, с пересадкой
+                # и без), берём меньшую цену.
+                if departure_time not in trips or price < trips[departure_time]:
+                    trips[departure_time] = price
 
-    return min(prices) if prices else None
+    return trips
 
 
 async def main():
@@ -251,28 +257,36 @@ async def main():
             elif min_price > prev_price:
                 changes.append(f"📈 {route['name']} ({route['depart_date']}): цена выросла {prev_price}€ → {min_price}€")
 
-        # --- Ecolines ---
+# --- Ecolines ---
         for route in ECOLINES_ROUTES:
-            key = f"ecolines-{route['origin']}-{route['destination']}-{route['depart_date']}"
             try:
-                min_price = await fetch_ecolines_min_price(page, route)
+                trips = await fetch_ecolines_trip_prices(page, route)
             except Exception as e:
                 print(f"[Ecolines] Ошибка при запросе «{route['name']}»: {e}", file=sys.stderr)
                 continue
 
-            if min_price is None:
-                print(f"[Ecolines] Не найдены доступные рейсы для «{route['name']}»", file=sys.stderr)
-                continue
+            for target_time in route["departure_times"]:
+                key = f"ecolines-{route['origin']}-{route['destination']}-{route['depart_date']}-{target_time}"
+                min_price = trips.get(target_time)
 
-            prev_price = history.get(key, {}).get("price")
-            history[key] = {"name": route["name"], "price": min_price, "date": route["depart_date"]}
+                if min_price is None:
+                    print(f"[Ecolines] Рейс {target_time} для «{route['name']}» не найден (возможно, распродан)", file=sys.stderr)
+                    continue
 
-            if prev_price is None:
-                changes.append(f"📊 {route['name']} ({route['depart_date']}): текущая цена {min_price} BYN")
-            elif min_price < prev_price:
-                changes.append(f"📉 {route['name']} ({route['depart_date']}): цена упала {prev_price} → {min_price} BYN")
-            elif min_price > prev_price:
-                changes.append(f"📈 {route['name']} ({route['depart_date']}): цена выросла {prev_price} → {min_price} BYN")
+                prev_price = history.get(key, {}).get("price")
+                history[key] = {
+                    "name": f"{route['name']} ({target_time})",
+                    "price": min_price,
+                    "date": route["depart_date"],
+                }
+
+                label = f"{route['name']} {target_time} ({route['depart_date']})"
+                if prev_price is None:
+                    changes.append(f"📊 {label}: текущая цена {min_price} BYN")
+                elif min_price < prev_price:
+                    changes.append(f"📉 {label}: цена упала {prev_price} → {min_price} BYN")
+                elif min_price > prev_price:
+                    changes.append(f"📈 {label}: цена выросла {prev_price} → {min_price} BYN")
 
         await browser.close()
 
