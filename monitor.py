@@ -1,6 +1,6 @@
 """
 Мониторинг цен на билеты Lux Express через официальный GraphQL API сайта.
-
+ 
 Как это работает:
 1. Playwright открывает главную страницу luxexpress.eu обычным headless-браузером —
    это нужно, чтобы пройти проверку Cloudflare и получить рабочую куку cf_clearance.
@@ -9,16 +9,16 @@
 3. Сравнивает цены с прошлым запуском (price_history.json) и шлёт уведомление
    в Telegram, если что-то изменилось.
 """
-
+ 
 import asyncio
 import json
 import os
 import sys
 from pathlib import Path
-
+ 
 import requests
 from playwright.async_api import async_playwright
-
+ 
 # ---------------------------------------------------------------------------
 # Настройка маршрутов для отслеживания
 # ---------------------------------------------------------------------------
@@ -41,14 +41,14 @@ ROUTES = [
     #     "adults": 1,
     # },
 ]
-
+ 
 HOMEPAGE_URL = "https://luxexpress.eu/ru/"
 GRAPHQL_URL = "https://luxexpress.eu/graphql"
 HISTORY_FILE = Path(__file__).parent / "price_history.json"
-
+ 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
+ 
 # Минимальный набор полей — только то, что реально нужно для мониторинга цен.
 # Полную версию запроса (со всеми полями рейса) можно найти в истории чата,
 # но она не нужна для отслеживания цены и лишний вес только всё усложняет.
@@ -89,8 +89,8 @@ query (
   }
 }
 """
-
-
+ 
+ 
 def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы, пропускаю отправку.", file=sys.stderr)
@@ -98,18 +98,18 @@ def send_telegram(text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
     resp.raise_for_status()
-
-
+ 
+ 
 def load_history() -> dict:
     if HISTORY_FILE.exists():
         return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
     return {}
-
-
+ 
+ 
 def save_history(history: dict) -> None:
     HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
+ 
+ 
 async def fetch_route_journeys(request_ctx, route: dict):
     """Делает GraphQL-запрос к /graphql и возвращает список рейсов (data.search)."""
     search_page_url = (
@@ -117,7 +117,7 @@ async def fetch_route_journeys(request_ctx, route: dict):
         f"&currency=EUR&fromBusStopId={route['from_stop_id']}&toBusStopId={route['to_stop_id']}"
         f"&adult={route['adults']}&senior=0&youth=0&pupil=0&child=0&affiliateId="
     )
-
+ 
     payload = {
         "variables": {
             "departureDate": route["depart_date"],
@@ -132,7 +132,7 @@ async def fetch_route_journeys(request_ctx, route: dict):
         },
         "query": GRAPHQL_QUERY,
     }
-
+ 
     response = await request_ctx.post(
         GRAPHQL_URL,
         headers={
@@ -144,17 +144,17 @@ async def fetch_route_journeys(request_ctx, route: dict):
         },
         data=json.dumps(payload),
     )
-
+ 
     if response.status != 200:
         raise RuntimeError(f"GraphQL вернул статус {response.status}: {await response.text()}")
-
+ 
     body = await response.json()
     if "errors" in body:
         raise RuntimeError(f"GraphQL вернул ошибки: {body['errors']}")
-
+ 
     return body.get("data", {}).get("search", [])
-
-
+ 
+ 
 def extract_min_price(journeys: list):
     """Минимальная цена среди всех доступных для продажи рейсов (эконом или бизнес)."""
     prices = []
@@ -166,12 +166,12 @@ def extract_min_price(journeys: list):
             if price is not None:
                 prices.append(float(price))
     return min(prices) if prices else None
-
-
+ 
+ 
 async def main():
     history = load_history()
     changes = []
-
+ 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -182,16 +182,16 @@ async def main():
             locale="ru-RU",
         )
         page = await context.new_page()
-
+ 
         # Скрываем типичный признак headless-браузера, который проверяет Cloudflare.
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
+ 
         # Заходим на главную, чтобы пройти проверку Cloudflare и получить cf_clearance.
         # "networkidle" на сайтах с фоновой аналитикой почти никогда не наступает,
         # поэтому ждём только загрузку DOM и даём дополнительное время на JS-челлендж.
         await page.goto(HOMEPAGE_URL, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(6000)
-
+ 
         cookies = await context.cookies()
         has_clearance = any(c["name"] == "cf_clearance" for c in cookies)
         if not has_clearance:
@@ -201,7 +201,7 @@ async def main():
             has_clearance = any(c["name"] == "cf_clearance" for c in cookies)
             if not has_clearance:
                 print("cf_clearance так и не появилась — Cloudflare, вероятно, блокирует этот запуск.", file=sys.stderr)
-
+ 
         for route in ROUTES:
             key = f"{route['from_stop_id']}-{route['to_stop_id']}-{route['depart_date']}"
             try:
@@ -209,32 +209,32 @@ async def main():
             except Exception as e:
                 print(f"Ошибка при запросе «{route['name']}»: {e}", file=sys.stderr)
                 continue
-
+ 
             min_price = extract_min_price(journeys)
             if min_price is None:
                 print(f"Не найдены доступные рейсы для «{route['name']}»", file=sys.stderr)
                 continue
-
+ 
             prev_price = history.get(key, {}).get("price")
             history[key] = {"name": route["name"], "price": min_price, "date": route["depart_date"]}
-
+ 
             if prev_price is None:
                 changes.append(f"📊 {route['name']} ({route['depart_date']}): текущая цена {min_price}€")
             elif min_price < prev_price:
                 changes.append(f"📉 {route['name']} ({route['depart_date']}): цена упала {prev_price}€ → {min_price}€")
             elif min_price > prev_price:
                 changes.append(f"📈 {route['name']} ({route['depart_date']}): цена выросла {prev_price}€ → {min_price}€")
-
+ 
         await browser.close()
-
+ 
     save_history(history)
-
+ 
     if changes:
         send_telegram("\n".join(changes))
         print("\n".join(changes))
     else:
         print("Изменений цен нет.")
-
-
+ 
+ 
 if __name__ == "__main__":
     asyncio.run(main())
