@@ -1,29 +1,29 @@
 """
-Мониторинг цен на билеты Lux Express через официальный GraphQL API сайта.
+Мониторинг цен на билеты Lux Express и Ecolines.
 
-Как это работает:
-1. Playwright открывает главную страницу luxexpress.eu обычным headless-браузером —
-   это нужно, чтобы пройти проверку Cloudflare и получить рабочую куку cf_clearance.
-2. Дальше скрипт делает POST-запрос напрямую к /graphql (используя ту же куку)
-   и получает список рейсов с ценами в чистом JSON — без парсинга HTML.
-3. Сравнивает цены с прошлым запуском (price_history.json) и шлёт уведомление
-   в Telegram, если что-то изменилось.
+Lux Express: официальный GraphQL API сайта (data.search).
+Ecolines: обычная сервер-рендеренная HTML-страница поиска (booking.ecolines.by),
+          парсится через BeautifulSoup.
+
+Оба перевозчика проверяются в одном прогоне через headless-браузер (Playwright),
+результаты сравниваются с прошлым запуском (price_history.json) и уведомление
+шлётся в Telegram только при изменении цены.
 """
 
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------------------------
-# Настройка маршрутов для отслеживания
+# Настройка маршрутов Lux Express
 # ---------------------------------------------------------------------------
-# from_stop_id / to_stop_id бери из адресной строки при поиске нужного
-# маршрута на luxexpress.eu (параметры fromBusStopId / toBusStopId в URL)
 ROUTES = [
     {
         "name": "Вильнюс → Варшава",
@@ -32,26 +32,32 @@ ROUTES = [
         "depart_date": "2026-09-04",
         "adults": 1,
     },
-    # Добавляй новые маршруты сюда, например:
-    # {
-    #     "name": "Вильнюс → Рига",
-    #     "from_stop_id": 18862,
-    #     "to_stop_id": 12345,
-    #     "depart_date": "2026-09-10",
-    #     "adults": 1,
-    # },
+    # Добавляй новые маршруты сюда
 ]
 
 HOMEPAGE_URL = "https://luxexpress.eu/ru/"
 GRAPHQL_URL = "https://luxexpress.eu/graphql"
+
+# ---------------------------------------------------------------------------
+# Настройка маршрутов Ecolines
+# ---------------------------------------------------------------------------
+ECOLINES_ROUTES = [
+    {
+        "name": "[Ecolines] Минск → Варшава",
+        "origin": 917,
+        "destination": 100,
+        "depart_date": "2026-09-04",
+    },
+    # Добавляй новые маршруты Ecolines сюда
+]
+
+ECOLINES_SEARCH_URL = "https://booking.ecolines.by/search/result"
+
 HISTORY_FILE = Path(__file__).parent / "price_history.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Минимальный набор полей — только то, что реально нужно для мониторинга цен.
-# Полную версию запроса (со всеми полями рейса) можно найти в истории чата,
-# но она не нужна для отслеживания цены и лишний вес только всё усложняет.
 GRAPHQL_QUERY = """
 query (
   $departureDate: Date!
@@ -111,7 +117,7 @@ def save_history(history: dict) -> None:
 
 
 async def fetch_route_journeys(request_ctx, route: dict):
-    """Делает GraphQL-запрос к /graphql и возвращает список рейсов (data.search)."""
+    """GraphQL-запрос к Lux Express, возвращает список рейсов (data.search)."""
     search_page_url = (
         f"https://luxexpress.eu/ru/tickets/search/?promocode=&departDate={route['depart_date']}"
         f"&currency=EUR&fromBusStopId={route['from_stop_id']}&toBusStopId={route['to_stop_id']}"
@@ -156,7 +162,7 @@ async def fetch_route_journeys(request_ctx, route: dict):
 
 
 def extract_min_price(journeys: list):
-    """Минимальная цена среди всех доступных для продажи рейсов (эконом или бизнес)."""
+    """Минимальная цена среди всех доступных для продажи рейсов Lux Express."""
     prices = []
     for j in journeys:
         if not j.get("IsForSale"):
@@ -165,6 +171,34 @@ def extract_min_price(journeys: list):
             price = j.get(field)
             if price is not None:
                 prices.append(float(price))
+    return min(prices) if prices else None
+
+
+async def fetch_ecolines_min_price(page, route: dict):
+    """
+    Открывает страницу поиска Ecolines (сервер-рендеренный HTML) и вытаскивает
+    минимальную цену среди рейсов.
+    """
+    url = (
+        f"{ECOLINES_SEARCH_URL}?allowedCurrency=26&locale=by&currency=26"
+        f"&outwardOrigin={route['origin']}&outwardDestination={route['destination']}"
+        f"&outwardDate={route['depart_date']}"
+    )
+    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    await page.wait_for_timeout(2000)
+
+    html = await page.content()
+    soup = BeautifulSoup(html, "html.parser")
+
+    prices = []
+    for card in soup.select("div.row.text-center"):
+        times = card.select("h2.no-mp")
+        btn = card.select_one("button.btn-primary.btn-lg[name=journey]")
+        if len(times) >= 2 and btn:
+            match = re.search(r"([\d.]+)\s*BYN", btn.get_text(" ", strip=True))
+            if match:
+                prices.append(float(match.group(1)))
+
     return min(prices) if prices else None
 
 
@@ -182,13 +216,9 @@ async def main():
             locale="ru-RU",
         )
         page = await context.new_page()
-
-        # Скрываем типичный признак headless-браузера, который проверяет Cloudflare.
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        # Заходим на главную, чтобы пройти проверку Cloudflare и получить cf_clearance.
-        # "networkidle" на сайтах с фоновой аналитикой почти никогда не наступает,
-        # поэтому ждём только загрузку DOM и даём дополнительное время на JS-челлендж.
+        # --- Lux Express: сначала проходим Cloudflare на главной странице ---
         await page.goto(HOMEPAGE_URL, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(6000)
 
@@ -197,22 +227,18 @@ async def main():
         if not has_clearance:
             print("Внимание: cf_clearance не получена, пробую подождать ещё раз...", file=sys.stderr)
             await page.wait_for_timeout(8000)
-            cookies = await context.cookies()
-            has_clearance = any(c["name"] == "cf_clearance" for c in cookies)
-            if not has_clearance:
-                print("cf_clearance так и не появилась — Cloudflare, вероятно, блокирует этот запуск.", file=sys.stderr)
 
         for route in ROUTES:
             key = f"{route['from_stop_id']}-{route['to_stop_id']}-{route['depart_date']}"
             try:
                 journeys = await fetch_route_journeys(context.request, route)
             except Exception as e:
-                print(f"Ошибка при запросе «{route['name']}»: {e}", file=sys.stderr)
+                print(f"[Lux Express] Ошибка при запросе «{route['name']}»: {e}", file=sys.stderr)
                 continue
 
             min_price = extract_min_price(journeys)
             if min_price is None:
-                print(f"Не найдены доступные рейсы для «{route['name']}»", file=sys.stderr)
+                print(f"[Lux Express] Не найдены доступные рейсы для «{route['name']}»", file=sys.stderr)
                 continue
 
             prev_price = history.get(key, {}).get("price")
@@ -224,6 +250,29 @@ async def main():
                 changes.append(f"📉 {route['name']} ({route['depart_date']}): цена упала {prev_price}€ → {min_price}€")
             elif min_price > prev_price:
                 changes.append(f"📈 {route['name']} ({route['depart_date']}): цена выросла {prev_price}€ → {min_price}€")
+
+        # --- Ecolines ---
+        for route in ECOLINES_ROUTES:
+            key = f"ecolines-{route['origin']}-{route['destination']}-{route['depart_date']}"
+            try:
+                min_price = await fetch_ecolines_min_price(page, route)
+            except Exception as e:
+                print(f"[Ecolines] Ошибка при запросе «{route['name']}»: {e}", file=sys.stderr)
+                continue
+
+            if min_price is None:
+                print(f"[Ecolines] Не найдены доступные рейсы для «{route['name']}»", file=sys.stderr)
+                continue
+
+            prev_price = history.get(key, {}).get("price")
+            history[key] = {"name": route["name"], "price": min_price, "date": route["depart_date"]}
+
+            if prev_price is None:
+                changes.append(f"📊 {route['name']} ({route['depart_date']}): текущая цена {min_price} BYN")
+            elif min_price < prev_price:
+                changes.append(f"📉 {route['name']} ({route['depart_date']}): цена упала {prev_price} → {min_price} BYN")
+            elif min_price > prev_price:
+                changes.append(f"📈 {route['name']} ({route['depart_date']}): цена выросла {prev_price} → {min_price} BYN")
 
         await browser.close()
 
