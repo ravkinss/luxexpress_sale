@@ -1,0 +1,35 @@
+name: Lux Express Price Monitor
+
+on:
+  schedule:
+    - cron: '0,30 * * * *'  # каждые 30 минут (время UTC)
+  workflow_dispatch: {}       # позволяет запускать вручную из вкладки Actions
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Commit updated price history
+        run: |
+          git config user.name "price-monitor-bot"
+          git config user.email "actions@github.com"
+          git add price_history.json
+          git diff --staged --quiet || git commit -m "Update price history [skip ci]"
+          git push
