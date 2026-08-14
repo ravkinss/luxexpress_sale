@@ -183,8 +183,24 @@ async def main():
         )
         page = await context.new_page()
 
+        # Скрываем типичный признак headless-браузера, который проверяет Cloudflare.
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
         # Заходим на главную, чтобы пройти проверку Cloudflare и получить cf_clearance.
-        await page.goto(HOMEPAGE_URL, wait_until="networkidle", timeout=45000)
+        # "networkidle" на сайтах с фоновой аналитикой почти никогда не наступает,
+        # поэтому ждём только загрузку DOM и даём дополнительное время на JS-челлендж.
+        await page.goto(HOMEPAGE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(6000)
+
+        cookies = await context.cookies()
+        has_clearance = any(c["name"] == "cf_clearance" for c in cookies)
+        if not has_clearance:
+            print("Внимание: cf_clearance не получена, пробую подождать ещё раз...", file=sys.stderr)
+            await page.wait_for_timeout(8000)
+            cookies = await context.cookies()
+            has_clearance = any(c["name"] == "cf_clearance" for c in cookies)
+            if not has_clearance:
+                print("cf_clearance так и не появилась — Cloudflare, вероятно, блокирует этот запуск.", file=sys.stderr)
 
         for route in ROUTES:
             key = f"{route['from_stop_id']}-{route['to_stop_id']}-{route['depart_date']}"
