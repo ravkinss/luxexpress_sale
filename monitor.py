@@ -1,4 +1,4 @@
-"""
+f"""
 Мониторинг цен на билеты Lux Express через официальный GraphQL API сайта.
 
 Как это работает:
@@ -61,7 +61,7 @@ ECOLINES_ROUTES = [
         "name": "[Ecolines] Минск → Варшава",
         "origin": 917,
         "destination": 100,
-        "depart_date": "2026-09-04",
+        "depart_date": "2026-09-03",
         "departure_times": ["09:15", "10:10"],
     },
     # Добавляй новые маршруты Ecolines сюда так же, с нужными departure_times
